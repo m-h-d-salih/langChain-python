@@ -126,3 +126,8 @@ print("confidence",result.confidence)
 as_dict=result.model_dump()
 # model_dump() = convert Pydantic object → plain Python dict.
 print("as dict",as_dict)
+
+# If you need a JSON string:
+as_json=result.model_dump_json(indent=2)  # pretty-printed JSON
+print("as json",as_json)
+# as josn
