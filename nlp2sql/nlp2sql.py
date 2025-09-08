@@ -3,39 +3,28 @@
 """
 Gemini-only NL→SQL router for MySQL using your db.json schema.
 
-What it does (end-to-end):
-- Stage 2.1: Calls Gemini with tools {mysql.query, web.search, no_action}
-- Stage 2.2: Parses output (even if not strict JSON), extracts SQL if present,
-             validates read-only + schema columns, auto-fixes COUNT intent,
-             and determines which tool to call with which params.
-
-Key features:
 - EXACT identifiers only (no renaming)
 - READ-ONLY guard: SELECT / WITH / SHOW / DESCRIBE only
+- Stage 2.1: LLM plans a tool call (mysql.query | web.search | no_action)
+- Stage 2.2: Parse output & determine {tool} with {params}
 - Relationship-aware (uses context.relationships first; shared-column hints as fallback)
 - Auto-repair loop on invalid SQL (qualified/unqualified checks)
-- .env auto-load (GOOGLE_API_KEY, GEMINI_ROUTER_MODEL, ROUTER_SCHEMA_MAX_CHARS)
+- .env auto-load (GOOGLE_API_KEY, GEMINI_ROUTER_MODEL)
 - REST transport (stable on Windows), no system→human warning
-- Schema context:
-    * By default loads FULL db.json into the LLM (so it can “learn” the whole schema).
-    * If db.json is very large, automatically slices to relevant tables (configurable).
-    * You can force full or slicing via CLI flags.
-- Ingests schema-provided examples (context.examples / context.example_queries) and prioritizes them
-- Robust JSON parsing + balanced-brace scan + “coercer” reprompt
-- Deterministic SALES ORDER fallback (joins project_details ↔ project_checklist)
-- Intent heuristic to auto-upgrade listy SELECTs to COUNT(*) when user asked “how many…”
-- Two tools exposed:
-    * mysql.query(sql, tables[], notes?)  — dry-run, returns SQL only (no DB exec)
-    * web.search(search_query)            — when the query isn’t answerable via schema/SQL
+- Schema SLICER + domain forcing:
+    * calibration → tools_register
+    * “sales order” → any table(s) with Sales_Order_No (joins preferred)
+    * seaman book → table(s) with Seaman_Doc (+ join to professional_details for names)
+    * “API Docs” → api_docs (+ project_details)
+- Ingests schema-provided examples (context.examples / context.example_queries)
+- Robust JSON parsing (balanced-brace scan) + REPROMPT-to-JSON stabilizer
+- Two-pass validation: sliced schema → full schema
+- If SQL is present but still fails strict validation, return mysql.query (low confidence) with validator notes.
+- Promote web.search → mysql.query if the web answer actually contains SQL.
+- NEW: If planner returns no_action (e.g., small talk), auto-fallback to web.search and return the LLM’s direct reply.
 
 Usage:
-  python nlp2sql.py --query "how many professionals in professional details" --schema_path ./db.json --print_json
-  python nlp2sql.py --query "news about IMO 2025 regulations" --schema_path ./db.json --print_json
-  python nlp2sql.py --query "List all checklist entries that reference Sales Order No..." --schema_path ./db.json --print_json
-
-Flags:
-  --no_slice    → always pass the entire db.json to LLM
-  --force_slice → always slice schema to the relevant subset
+  python nlp2sql.py --query "List all checklist entries that reference Sales Order No for redundancy validation." --schema_path ./db.json --print_json
 """
 
 import argparse
@@ -52,11 +41,6 @@ try:
 except Exception:
     pass
 
-# ---------------- configuration ----------------
-DEFAULT_MODEL = "gemini-1.5-pro"
-# If schema file exceeds this many characters, we’ll slice to keep latency/cost sane.
-ROUTER_SCHEMA_MAX_CHARS = int(os.getenv("ROUTER_SCHEMA_MAX_CHARS", "350000"))
-
 # ---------------- LLM (Gemini only) ----------------
 def init_llm(model_name: Optional[str] = None):
     try:
@@ -70,12 +54,12 @@ def init_llm(model_name: Optional[str] = None):
     if not os.getenv("GOOGLE_API_KEY"):
         raise RuntimeError("GOOGLE_API_KEY not set. Put it in your .env or set the env var.")
 
-    model = (model_name or os.getenv("GEMINI_ROUTER_MODEL") or DEFAULT_MODEL).strip()
+    model = (model_name or os.getenv("GEMINI_ROUTER_MODEL") or "gemini-1.5-pro").strip()
     return ChatGoogleGenerativeAI(
         model=model,
         temperature=0,
         transport="rest",
-        convert_system_message_to_human=False,   # avoids the deprecation warning
+        convert_system_message_to_human=False,
         max_output_tokens=1200,
     )
 
@@ -154,7 +138,6 @@ def build_explicit_relationships(schema_text: str) -> List[Dict[str, str]]:
     return rels
 
 def shared_columns_map(catalog: Dict[str, List[str]]) -> Dict[Tuple[str,str], List[str]]:
-    """Case-insensitive 'shared columns' hints (for JOIN guidance only)."""
     tables = list(catalog.keys())
     rel: Dict[Tuple[str,str], List[str]] = {}
     for i in range(len(tables)):
@@ -231,6 +214,8 @@ def expand_synonyms(words: Set[str]) -> Set[str]:
         expanded |= {"professional","professionals","employee","personnel"}
     if {"sales","order","salesorder"} & words:
         expanded |= {"sales","order","sales_order","sales_order_no","so","so_no"}
+    if {"api","docs","api_docs"} & words:
+        expanded |= {"api","docs","api_docs"}
     return expanded
 
 def query_tokens(user_query: str) -> Set[str]:
@@ -238,6 +223,8 @@ def query_tokens(user_query: str) -> Set[str]:
     uq = user_query.lower()
     if "sales order" in uq:
         raw |= {"sales","order","sales_order","sales_order_no"}
+    if "api docs" in uq or "api_docs" in uq:
+        raw |= {"api","docs","api_docs"}
     return expand_synonyms(raw)
 
 # ------------- ranking helpers (for EXAMPLES ONLY) -------------
@@ -261,7 +248,7 @@ def calibration_rank(colname: str, ctype: str = "") -> int:
     if "calib" in n: score += 30
     if "certificate" in n or "cert" in n: score += 15
     if "verification" in n: score += 12
-    if "validity" in n or "expiry" in n or "expire" in n: score += 12
+    if "validity" in n or "expiry" in n: score += 12
     if "next" in n: score += 8
     if "date" in n: score += 8
     if "date" in n and ("date" in t or "datetime" in t or "timestamp" in t): score += 10
@@ -296,7 +283,6 @@ def force_tables_for_query(user_query: str, all_tables: List[dict], catalog: Dic
     names = {t.get("name"): t for t in all_tables if t.get("name")}
     forced: List[str] = []
 
-    # Calibration
     if {"calibration","caliberation","calib","cal"} & tokens or {"tool","tools","gauge","instrument"} & tokens:
         if "tools_register" in names:
             cols = catalog.get("tools_register", [])
@@ -305,7 +291,6 @@ def force_tables_for_query(user_query: str, all_tables: List[dict], catalog: Dic
             if cal_cols:
                 forced = ["tools_register"]
 
-    # Seaman doc
     if {"seaman","book","seamanbook","cdc"} & tokens:
         seaman_tables = [t for t in names if any(c.lower() == "seaman_doc" for c in catalog.get(t, []))]
         if seaman_tables:
@@ -314,12 +299,17 @@ def force_tables_for_query(user_query: str, all_tables: List[dict], catalog: Dic
             else:
                 forced = seaman_tables
 
-    # Sales order
     uq = user_query.lower()
     if "sales order" in uq or "sales_order" in uq or "sales_order_no" in uq:
         so_tables = [t for t, cols in catalog.items() if any(c.lower() == "sales_order_no" for c in cols)]
         if so_tables:
             forced = list(dict.fromkeys(so_tables))
+
+    if {"api","docs","api_docs"} & tokens and "api_docs" in names:
+        forced = list(dict.fromkeys((forced or []) + ["api_docs"]))
+        if "project_details" in names:
+            forced.append("project_details")
+
     return forced
 
 # ------------- schema slicing ---------------------
@@ -329,7 +319,6 @@ def slice_schema(schema_text: str, user_query: str, max_tables: int = 14) -> Tup
     all_tables = ctx.get("tables") or []
     explicit = ctx.get("relationships") or []
 
-    # prebuild maps
     catalog_full = {}
     types_full = {}
     for t in all_tables:
@@ -339,7 +328,6 @@ def slice_schema(schema_text: str, user_query: str, max_tables: int = 14) -> Tup
         catalog_full[tn] = [c.get("name") for c in (t.get("columns") or []) if c.get("name")]
         types_full[tn] = {c.get("name"): (c.get("type") or "").lower() for c in (t.get("columns") or []) if c.get("name")}
 
-    # 1) Domain forcing
     forced = force_tables_for_query(user_query, all_tables, catalog_full, types_full)
     if forced:
         kept_names = set(forced)
@@ -354,7 +342,6 @@ def slice_schema(schema_text: str, user_query: str, max_tables: int = 14) -> Tup
             sliced["context"]["relationships"] = kept_rels
         return json.dumps(sliced, ensure_ascii=False), [t["name"] for t in kept_tables if t.get("name")], kept_rels
 
-    # 2) Score-based slicer
     qwords = query_tokens(user_query)
     qnorms = {normalize_simple(w) for w in qwords}
 
@@ -486,6 +473,12 @@ def _segment(sql: str, start_kw: str, end_kws: List[str]) -> Optional[str]:
                 end = cand_end
     return sql[start:end]
 
+def _remove_select_alias_tokens(tokens: List[str], segment: str) -> List[str]:
+    aliases = set(m.group(1) for m in re.finditer(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\b", segment, flags=re.I))
+    if not aliases:
+        return tokens
+    return [t for t in tokens if t not in aliases]
+
 def validate_tables_and_columns(sql: str, catalog: Dict[str, List[str]]) -> Tuple[bool, List[str], str]:
     errors: List[str] = []
     aliases = parse_aliases(sql)
@@ -521,6 +514,8 @@ def validate_tables_and_columns(sql: str, catalog: Dict[str, List[str]]) -> Tupl
             if not seg:
                 continue
             tokens = _unqualified_tokens(seg)
+            if clause == "SELECT":
+                tokens = _remove_select_alias_tokens(tokens, seg)
             if tokens:
                 errors.append(f"In {clause}, qualify columns with table/alias (found unqualified: {sorted(set(tokens))}).")
     else:
@@ -541,6 +536,8 @@ def validate_tables_and_columns(sql: str, catalog: Dict[str, List[str]]) -> Tupl
                 if not seg:
                     continue
                 tokens = _unqualified_tokens(seg)
+                if clause == "SELECT":
+                    tokens = _remove_select_alias_tokens(tokens, seg)
                 unknown = [t for t in tokens if t not in table_cols]
                 if unknown:
                     sample = ", ".join(sorted(list(table_cols))[:16]) + ("" if len(table_cols) <= 16 else ", …")
@@ -564,55 +561,7 @@ def validate_tables_and_columns(sql: str, catalog: Dict[str, List[str]]) -> Tupl
 
     return True, [], ""
 
-# ---- count intent + SQL rewrite ----
-_COUNT_INTENT = re.compile(r"\b(how\s+many|number\s+of|count|total\s+number)\b", re.I)
-
-def wants_count(user_query: str) -> bool:
-    return bool(_COUNT_INTENT.search(user_query or ""))
-
-def _strip_order_limit(sql: str) -> str:
-    s = re.sub(r"(?is)\border\s+by\b.*?(?=(\blimit\b|$))", "", sql)
-    s = re.sub(r"(?is)\blimit\b\s+\d+(\s*,\s*\d+)?\s*;?$", "", s)
-    return s.strip()
-
-def force_count_sql_if_needed(user_query: str, sql: str) -> str:
-    if not wants_count(user_query):
-        return sql
-    if re.search(r"(?i)\bcount\s*\(", sql):
-        return sql
-    s = _strip_order_limit(sql)
-    m = re.search(r"(?is)\bselect\b\s+.*?\bfrom\b", s)
-    if not m:
-        return sql
-    s2 = re.sub(r"(?is)\bselect\b\s+.*?\bfrom\b", "SELECT COUNT(*) AS total_count FROM", s, count=1)
-    s2 = s2.strip()
-    if not s2.endswith(";"):
-        s2 += ";"
-    return s2
-
-# ---------- use schema-provided examples (priority) ----------
-def extract_schema_examples(schema_text: str) -> List[Dict[str, Any]]:
-    """Supports context.examples or context.example_queries with {question, sql_query}."""
-    try:
-        obj = json.loads(schema_text)
-        ctx = _get_ctx(obj)
-    except Exception:
-        return []
-    raw = ctx.get("examples") or ctx.get("example_queries") or []
-    out: List[Dict[str, Any]] = []
-    for it in raw:
-        q = it.get("question") or it.get("query") or it.get("user") or ""
-        sql = it.get("sql_query") or it.get("sql") or ""
-        if not q or not sql:
-            continue
-        tabs = extract_tables_from_sql(sql)
-        out.append({
-            "user": q,
-            "json": {"tool_name":"mysql.query","params":{"sql": sql if sql.strip().endswith(";") else sql.strip()+";","tables": tabs},"confidence":0.95}
-        })
-    return out
-
-# ------------- dynamic few-shots ------------------
+# ------------- helpers for examples ---------------
 def guess_name_column(catalog: Dict[str, List[str]], table: str) -> str:
     prefs = ["Customer_Name","Name","Full_Name","Employee_Name","Professional_Name","Title","Description","Instrument_Type"]
     cols = catalog.get(table, [])
@@ -641,6 +590,28 @@ def month_year_predicate(table: str, col: str, coltype: str, month_year: Optiona
         return f"YEAR({table}.{col}) = {y} AND MONTH({table}.{col}) = {m}"
     return f"{table}.{col} LIKE '%{disp}%'"
 
+# ---------- use schema-provided examples (priority) ----------
+def extract_schema_examples(schema_text: str) -> List[Dict[str, Any]]:
+    try:
+        obj = json.loads(schema_text)
+        ctx = _get_ctx(obj)
+    except Exception:
+        return []
+    raw = ctx.get("examples") or ctx.get("example_queries") or []
+    out: List[Dict[str, Any]] = []
+    for it in raw:
+        q = it.get("question") or it.get("query") or it.get("user") or ""
+        sql = it.get("sql_query") or it.get("sql") or ""
+        if not q or not sql:
+            continue
+        tabs = extract_tables_from_sql(sql)
+        out.append({
+            "user": q,
+            "json": {"tool_name":"mysql.query","params":{"sql": sql if sql.strip().endswith(";") else sql.strip()+";","tables": tabs},"confidence":0.95}
+        })
+    return out
+
+# ------------- dynamic few-shots ------------------
 def build_examples_json(user_query: str,
                         kept_tables: List[str],
                         catalog: Dict[str, List[str]],
@@ -649,9 +620,9 @@ def build_examples_json(user_query: str,
                         schema_examples: List[Dict[str, Any]]) -> str:
     q_month = parse_month_year(user_query)
     ex: List[Dict[str, Any]] = []
-    ex.extend(schema_examples[:20])  # schema-provided examples first
 
-    # per-table basics
+    ex.extend(schema_examples[:20])
+
     for t in kept_tables:
         cols = catalog.get(t, [])
         ttypes = types.get(t, {})
@@ -692,7 +663,6 @@ def build_examples_json(user_query: str,
                     "json": {"tool_name":"mysql.query","params":{"sql":f"SELECT {c} FROM {t} WHERE {pred} LIMIT 50;","tables":[t]},"confidence":0.86}
                 })
 
-    # explicit relationship join samples
     for r in explicit_rels[:12]:
         a, ac, b, bc = r["source_table"], r["source_column"], r["target_table"], r["target_column"]
         if a in kept_tables and b in kept_tables:
@@ -703,7 +673,6 @@ def build_examples_json(user_query: str,
                 "json": {"tool_name":"mysql.query","params":{"sql":f"SELECT p.{a_name}, x.{b_name} FROM {a} AS p JOIN {b} AS x ON p.{ac} = x.{bc} LIMIT 20;","tables":[a,b],"notes":f"Explicit: {a}.{ac} = {b}.{bc}"},"confidence":0.86}
             })
 
-    # seaman presence example if any
     sea_hits = []
     for t in kept_tables:
         for c in catalog.get(t, []):
@@ -723,8 +692,14 @@ def build_examples_json(user_query: str,
                     "tables":["professional_details", t],
                     "notes":"seaman doc presence via explicit relationship"},"confidence":0.9}
             })
+        else:
+            ex.append({
+                "user": "list all professionals who have seaman book",
+                "json": {"tool_name":"mysql.query","params":{
+                    "sql":f"SELECT * FROM {t} WHERE {t}.{c} IS NOT NULL AND {t}.{c} <> '' LIMIT 50;",
+                    "tables":[t]},"confidence":0.85}
+            })
 
-    # calibration April 2025 → prefer tools_register
     if "tools_register" in kept_tables:
         cols = catalog["tools_register"]; ttypes = types.get("tools_register", {})
         best_col = None; best_score = -1
@@ -748,20 +723,21 @@ def build_examples_json(user_query: str,
 
 # ---------------- Prompts -------------------------
 PLANNER_SYSTEM_TEXT = (
-    "You are Ergontec’s MySQL SQL writer and router.\n\n"
+    "You are Ergontec’s MySQL SQL writer.\n\n"
     "Return STRICT JSON only:\n"
     "{\"tool_name\":\"...\", \"params\":{...}, \"confidence\": <0..1>, \"rationale\": \"...\"}\n\n"
-    "Tools you may choose:\n"
-    "- \"mysql.query\": Use when the answer requires reading the provided MySQL schema. Produce exactly ONE read-only SQL statement (SELECT / WITH / SHOW / DESCRIBE). Fully qualify columns when joining multiple tables. Use ONLY identifiers present in the schema JSON, exact spelling.\n"
-    "- \"web.search\": Use when the user’s question isn’t answerable from the provided schema (news, web info, general knowledge, etc.). Return params: {\"search_query\": \"<user query as-is>\"}.\n"
-    "- \"no_action\": Use when ambiguous or not answerable.\n\n"
-    "JOIN guidance:\n"
-    "- Prefer EXPLICIT RELATIONSHIPS from the schema JSON (e.g., A.x ↔ B.y).\n"
-    "- If none apply, you may use shared columns present in both tables (case-insensitive hints are provided).\n"
-    "- When joining 2+ tables, FULLY QUALIFY columns as table_or_alias.column.\n\n"
+    "Rules:\n"
+    "- tool_name ∈ {\"mysql.query\",\"web.search\",\"no_action\"}.\n"
+    "- Prefer mysql.query when the question can be answered from the provided schema.\n"
+    "- Prefer web.search (NOT no_action) for general, conversational, or non-DB questions.\n"
+    "- Use ONLY identifiers present in the provided schema JSON, EXACT spelling/casing.\n"
+    "- Prefer EXPLICIT RELATIONSHIPS for JOINs; otherwise shared-column hints.\n"
+    "- When joining, FULLY QUALIFY columns.\n"
+    "- mysql.query must be ONE read-only statement (SELECT/WITH/SHOW/DESCRIBE).\n"
+    "- web.search must include a short natural-language answer in params.answer.\n"
+    "- If truly impossible to decide, you may use no_action with a short reason.\n"
     "Hard requirements for Sales Order queries:\n"
-    "- If multiple tables have Sales_Order_No AND a relationship exists (e.g., project_details.Sales_Order_No ↔ project_checklist.Sales_Order_No), you MUST join them.\n"
-    "Be concise and deterministic."
+    "- If <= relationship between tables via Sales_Order_No exists, you MUST join them.\n"
 )
 
 PLANNER_USER_TEMPLATE = """User query:
@@ -769,10 +745,10 @@ PLANNER_USER_TEMPLATE = """User query:
 
 Tools:
 - mysql.query(sql, tables[], notes?)
-- web.search(search_query)
+- web.search(answer)
 - no_action(reason)
 
-Schema context (JSON passed to you):
+Sliced Schema (JSON):
 {schema_json}
 
 Relationship guide (EXPLICIT first, then shared-column hints):
@@ -798,7 +774,7 @@ Validation feedback to address:
 Return corrected STRICT JSON now:
 """
 
-# ---------------- JSON helpers (robust + stabilizer) --------------------
+# ---------------- JSON helpers --------------------
 def _extract_first_json_object(text: str) -> Dict[str, Any]:
     try:
         return json.loads(text)
@@ -810,7 +786,6 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
             return json.loads(m.group(1))
         except Exception:
             pass
-    # scan for first balanced {...}
     s = text
     start = s.find("{")
     while start != -1:
@@ -845,6 +820,28 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
 def force_json(text: str) -> Dict[str, Any]:
     return _extract_first_json_object(text)
 
+# --------------- SQL extraction from any text ------------------
+SQL_FENCE_RE = re.compile(r"```(?:sql)?\s*(SELECT|WITH|SHOW|DESCRIBE|DESC)\b(.+?)```", re.I | re.S)
+SQL_INLINE_RE = re.compile(r"\b(SELECT|WITH|SHOW|DESCRIBE|DESC)\b.+?;", re.I | re.S)
+
+def extract_sql_from_any(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = SQL_FENCE_RE.search(text)
+    if m:
+        start_kw = m.group(1)
+        rest = m.group(2)
+        cand = (start_kw + " " + rest).strip()
+        m2 = SQL_INLINE_RE.search(cand)
+        if m2:
+            stmt = m2.group(0)
+            return stmt.strip()
+    m3 = SQL_INLINE_RE.search(text)
+    if m3:
+        return m3.group(0).strip()
+    return None
+
+# ---------------- LLM call helpers -----------------
 def _invoke_llm(llm, system_text: str, human_text: str) -> str:
     from langchain_core.prompts import ChatPromptTemplate
     prompt = ChatPromptTemplate.from_messages([
@@ -855,15 +852,10 @@ def _invoke_llm(llm, system_text: str, human_text: str) -> str:
     raw = msg.invoke({"system_text": system_text, "human_text": human_text})
     return getattr(raw, "content", str(raw))
 
-def llm_plan(llm, system_text: str, human_text: str) -> Tuple[Dict[str, Any], str]:
-    """
-    Try normal call → parse JSON.
-    If it fails, REPROMPT with a tiny instruction to output ONLY valid JSON.
-    Returns (parsed_json, raw_text_used_for_parse)
-    """
+def llm_plan(llm, system_text: str, human_text: str) -> Dict[str, Any]:
     text = _invoke_llm(llm, system_text, human_text)
     try:
-        return force_json(text), text
+        return force_json(text)
     except Exception:
         coercer = (
             "Return ONLY valid JSON with keys: tool_name, params, confidence, rationale.\n"
@@ -871,52 +863,27 @@ def llm_plan(llm, system_text: str, human_text: str) -> Tuple[Dict[str, Any], st
             "{\"tool_name\":\"no_action\",\"params\":{\"reason\":\"unsure\"},\"confidence\":0,\"rationale\":\"coercer\"}"
         )
         text2 = _invoke_llm(llm, "You must output strict JSON.", coercer + "\n\nPrevious content (for reference only):\n" + text)
-        return force_json(text2), text2
+        return force_json(text2)
 
-# --------- SQL extraction from arbitrary text (code fences, inline, etc.) ---------
-_SQL_FENCE = re.compile(r"```(?:sql)?\s*(SELECT|WITH|SHOW|DESCRIBE|DESC)\b(.*?)```", re.I | re.S)
-_SQL_INLINE = re.compile(r"\b(SELECT|WITH|SHOW|DESCRIBE|DESC)\b[\s\S]+", re.I)
-
-def extract_sql_from_any(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = _SQL_FENCE.search(text)
-    if m:
-        body = m.group(1) + m.group(2)
-        sql = body.strip()
-        # keep first statement only
-        sql = sql.split(";")[0] + ";"
-        return sql
-    # fallback: grab from first SELECT/...
-    m2 = _SQL_INLINE.search(text)
-    if m2:
-        sql = m2.group(0).strip()
-        # cut at first semicolon if multiple
-        parts = [p.strip() for p in sql.split(";") if p.strip()]
-        if not parts:
-            return None
-        sql1 = parts[0]
-        if not sql1.endswith(";"):
-            sql1 += ";"
-        return sql1
-    return None
+def llm_small_talk_answer(llm, user_query: str) -> str:
+    """When planner returns no_action, get a short conversational answer."""
+    sys_text = "You are a friendly assistant. Answer the user's message briefly and naturally."
+    human_text = user_query
+    return _invoke_llm(llm, sys_text, human_text)
 
 # ---------------- Deterministic SALES ORDER fallback ------------
 def deterministic_sales_order(user_query: str, catalog: Dict[str, List[str]], rels: List[Dict[str,str]]) -> Optional[Dict[str, Any]]:
     uq = user_query.lower()
     if not ("sales order" in uq or "sales_order" in uq or "sales_order_no" in uq):
         return None
-
     tables_with_so = [t for t, cols in catalog.items() if "Sales_Order_No" in cols]
     if not tables_with_so:
         return None
-
     has_pd = "project_details" in tables_with_so
     has_pc = "project_checklist" in tables_with_so
     joined = False
     sql = None
     tabs: List[str] = []
-
     if has_pd and has_pc:
         rel_ok = any((r.get("source_table")=="project_details" and r.get("target_table")=="project_checklist" and
                       r.get("source_column")=="Sales_Order_No" and r.get("target_column")=="Sales_Order_No")
@@ -931,12 +898,10 @@ def deterministic_sales_order(user_query: str, catalog: Dict[str, List[str]], re
             sql = f"SELECT {cols_sql} FROM project_details AS pd JOIN project_checklist AS pc ON pd.Sales_Order_No = pc.Sales_Order_No;"
             tabs = ["project_details", "project_checklist"]
             joined = True
-
     if not sql:
         t = tables_with_so[0]
         sql = f"SELECT * FROM {t} WHERE {t}.Sales_Order_No IS NOT NULL;"
         tabs = [t]
-
     return {
         "tool_name": "mysql.query",
         "params": {"sql": sql, "tables": tabs, "notes": "deterministic Sales_Order_No route" if joined else "single-table Sales_Order_No presence"},
@@ -945,32 +910,23 @@ def deterministic_sales_order(user_query: str, catalog: Dict[str, List[str]], re
     }
 
 # ---------------- Router --------------------------
-def route(user_query: str, schema_text: str, model_name: Optional[str] = None,
-          force_full: bool = False, force_slice: bool = False) -> Dict[str, Any]:
+def route(user_query: str, schema_text: str, model_name: Optional[str] = None) -> Dict[str, Any]:
+    sliced_schema_json, kept_table_names, kept_rels = slice_schema(schema_text, user_query, max_tables=14)
 
-    # Decide full vs sliced schema for LLM context
-    use_full = force_full or (not force_slice and len(schema_text) <= ROUTER_SCHEMA_MAX_CHARS)
+    catalog_sliced = build_schema_catalog(sliced_schema_json)
+    types_sliced = build_type_map(sliced_schema_json)
+    catalog_full = build_schema_catalog(schema_text)
+    types_full = build_type_map(schema_text)
 
-    if use_full:
-        sliced_schema_json = schema_text  # full pass-through
-        # derive kept tables + rels from full
-        _tables, _rels = parse_tables_and_relationships(schema_text)
-        kept_table_names = [t.get("name") for t in _tables if t.get("name")]
-        explicit_rels = _rels
-    else:
-        sliced_schema_json, kept_table_names, explicit_rels = slice_schema(schema_text, user_query, max_tables=14)
-
-    catalog = build_schema_catalog(sliced_schema_json)
-    types = build_type_map(sliced_schema_json)
-    shared_rels = shared_columns_map(catalog)
+    explicit_rels = kept_rels
+    shared_rels = shared_columns_map(catalog_sliced)
     rel_text = relationships_text(explicit_rels, shared_rels)
 
     schema_examples = extract_schema_examples(schema_text)
-    examples_json = build_examples_json(user_query, kept_table_names, catalog, types, explicit_rels, schema_examples)
+    examples_json = build_examples_json(user_query, kept_table_names, catalog_sliced, types_sliced, explicit_rels, schema_examples)
 
     llm = init_llm(model_name or os.getenv("GEMINI_ROUTER_MODEL"))
 
-    # Stage 2.1: plan
     human_text = PLANNER_USER_TEMPLATE.format(
         user_query=user_query,
         schema_json=sliced_schema_json,
@@ -979,105 +935,104 @@ def route(user_query: str, schema_text: str, model_name: Optional[str] = None,
     )
 
     try:
-        data, raw_text = llm_plan(llm, PLANNER_SYSTEM_TEXT, human_text)
+        data = llm_plan(llm, PLANNER_SYSTEM_TEXT, human_text)
     except Exception:
-        # If the model refuses/returns garbage, try deterministic sales order fallback if applicable
-        fallback = deterministic_sales_order(user_query, catalog, explicit_rels)
+        fallback = deterministic_sales_order(user_query, catalog_full, build_explicit_relationships(schema_text))
         if fallback:
             return fallback
-        # Not a DB topic? Route to web.search
-        return {"tool_name": "web.search", "params": {"search_query": user_query}, "confidence": 0.55, "rationale": "LLM output not parseable; route to web"}
+        # final fallback → conversational web.answer
+        ans = llm_small_talk_answer(llm, user_query)
+        return {"tool_name": "web.search", "params": {"answer": ans}, "confidence": 0.0, "rationale": "exception"}
 
-    # Stage 2.2: parse output & determine tool (mysql.query | web.search | no_action)
     tool = (data.get("tool_name") or "").strip()
     params = data.get("params") or {}
+    rationale = data.get("rationale", "")
+    confidence = float(data.get("confidence", 0.8)) if isinstance(data.get("confidence", 0.8), (int, float)) else 0.8
 
-    # If model chose web.search directly, return it
+    # Promote web.search → mysql.query if SQL is present
     if tool == "web.search":
-        q = params.get("search_query") or user_query
-        return {"tool_name": "web.search", "params": {"search_query": q}, "confidence": float(data.get("confidence", 0.7)), "rationale": data.get("rationale","web")}
+        answer = params.get("answer") or ""
+        promoted_sql = extract_sql_from_any(answer)
+        if promoted_sql:
+            tool = "mysql.query"
+            params = {"sql": promoted_sql, "tables": [], "notes": "promoted from web.search (SQL detected in answer)"}
 
-    # If model chose no_action, consider deterministic Sales Order fallback, else web.search
-    if tool not in {"mysql.query", "web.search"}:
-        fallback = deterministic_sales_order(user_query, catalog, explicit_rels)
-        if fallback:
-            return fallback
-        return {"tool_name": "web.search", "params": {"search_query": user_query}, "confidence": 0.6, "rationale": f"Unsupported tool '{tool}' → web"}
-
+    # If planner chose no_action → return web.search with a short LLM answer
     if tool == "no_action":
-        fallback = deterministic_sales_order(user_query, catalog, explicit_rels)
+        # Sales Order deterministic rescue
+        fallback = deterministic_sales_order(user_query, catalog_full, build_explicit_relationships(schema_text))
         if fallback:
             return fallback
-        return {"tool_name": "web.search", "params": {"search_query": user_query}, "confidence": 0.55, "rationale": data.get("rationale","no_action")}
-
-    # tool == mysql.query (expected path), but still robustly handle non-JSON answers:
-    sql = (params.get("sql") or "").strip()
-    if not sql:
-        # Try to extract SQL from the raw text (non-strict JSON scenarios)
-        extracted = extract_sql_from_any(raw_text)
-        if extracted:
-            sql = extracted.strip()
-
-    # If still no SQL, this likely isn't answerable from DB → web.search
-    if not sql:
-        # deterministic Sales Order fallback if query implies it
-        fallback = deterministic_sales_order(user_query, catalog, explicit_rels)
-        if fallback:
-            return fallback
-        return {"tool_name": "web.search", "params": {"search_query": user_query}, "confidence": 0.65, "rationale": "No SQL found → web"}
-
-    # normalize + COUNT(*) upgrade if the user asked “how many…”
-    sql = force_count_sql_if_needed(user_query, sql)
-    if not sql.endswith(";"):
-        sql += ";"
-
-    # read-only safety
-    if not is_read_only(sql):
-        return {"tool_name": "no_action", "params": {"reason": "non read-only or multi-statement SQL"}, "confidence": 0.0, "rationale": "safety"}
-
-    # validate tables & columns; attempt repair loop if LLM JSON present
-    ok, errs, feedback = validate_tables_and_columns(sql, catalog)
-    if ok:
-        aliases = parse_aliases(sql)
-        final_tables = sorted(set(aliases.values())) or (params.get("tables") or []) or sorted(set(extract_tables_from_sql(sql)))
+        ans = llm_small_talk_answer(llm, user_query)
         return {
-            "tool_name": "mysql.query",
-            "params": {"sql": sql, "tables": final_tables, "notes": params.get("notes", "")},
-            "confidence": float(data.get("confidence", 0.9)) if isinstance(data.get("confidence", 0.9), (int, float)) else 0.9,
-            "rationale": data.get("rationale", "validated")
+            "tool_name": "web.search",
+            "params": {"answer": ans},
+            "confidence": 0.6,
+            "rationale": "general/non-DB"
         }
 
-    # If invalid SQL, try one repair round with validator feedback
-    try:
-        repair_human = REPAIR_USER_TEMPLATE.format(validator_feedback=feedback)
-        data2, raw2 = llm_plan(llm, PLANNER_SYSTEM_TEXT, repair_human)
-        tool2 = (data2.get("tool_name") or "").strip()
-        params2 = data2.get("params") or {}
-        sql2 = (params2.get("sql") or "").strip() or extract_sql_from_any(raw2) or ""
-        if sql2:
-            sql2 = force_count_sql_if_needed(user_query, sql2)
-            if not sql2.endswith(";"):
-                sql2 += ";"
-            if is_read_only(sql2):
-                ok2, errs2, feedback2 = validate_tables_and_columns(sql2, catalog)
-                if ok2:
-                    aliases = parse_aliases(sql2)
-                    final_tables = sorted(set(aliases.values())) or (params2.get("tables") or []) or sorted(set(extract_tables_from_sql(sql2)))
-                    return {
-                        "tool_name": "mysql.query",
-                        "params": {"sql": sql2, "tables": final_tables, "notes": params2.get("notes", "")},
-                        "confidence": float(data2.get("confidence", 0.88)) if isinstance(data2.get("confidence", 0.88), (int, float)) else 0.88,
-                        "rationale": data2.get("rationale", "validated (repaired)" )
-                    }
-    except Exception:
-        pass
+    if tool == "web.search":
+        return {
+            "tool_name": "web.search",
+            "params": {"answer": params.get("answer","")},
+            "confidence": confidence,
+            "rationale": rationale or "web/general"
+        }
 
-    # As a last resort, Sales Order deterministic fallback or web
-    fallback = deterministic_sales_order(user_query, catalog, explicit_rels)
-    if fallback:
-        return fallback
+    if tool not in {"mysql.query", "web.search"}:
+        fallback = deterministic_sales_order(user_query, catalog_full, build_explicit_relationships(schema_text))
+        if fallback:
+            return fallback
+        ans = llm_small_talk_answer(llm, user_query)
+        return {"tool_name": "web.search", "params": {"answer": ans}, "confidence": 0.5, "rationale": "unknown tool"}
 
-    return {"tool_name": "web.search", "params": {"search_query": user_query}, "confidence": 0.6, "rationale": "Validation failed; route to web"}
+    # ---- mysql.query path ----
+    sql = (params.get("sql") or "").strip()
+    if not sql:
+        alt_sql = extract_sql_from_any(rationale)
+        if alt_sql:
+            sql = alt_sql
+        else:
+            return {"tool_name": "web.search", "params": {"answer": "I couldn't form a SQL query for that."}, "confidence": 0.4, "rationale": "missing sql"}
+
+    if not sql.endswith(";"):
+        sql += ";"
+        params["sql"] = sql
+
+    if not is_read_only(sql):
+        return {"tool_name": "web.search", "params": {"answer": "The generated SQL looked unsafe (write or multi-statement)."}, "confidence": 0.3, "rationale": "safety"}
+
+    ok, errs, feedback = validate_tables_and_columns(sql, catalog_sliced)
+    if not ok:
+        ok2, errs2, feedback2 = validate_tables_and_columns(sql, catalog_full)
+        if ok2:
+            ok, errs, feedback = True, [], ""
+        else:
+            errs, feedback = errs2, feedback2
+
+    if not ok:
+        note = "validation failed; returning LLM SQL as-is. " + (feedback[:800] + ("…" if len(feedback) > 800 else ""))
+        aliases = parse_aliases(sql)
+        final_tables = sorted(set(aliases.values())) or sorted(set(extract_tables_from_sql(sql)))
+        return {
+            "tool_name": "mysql.query",
+            "params": {"sql": sql, "tables": final_tables, "notes": note},
+            "confidence": 0.55,
+            "rationale": "SQL present; bypassing strict validation"
+        }
+
+    aliases = parse_aliases(sql)
+    final_tables = sorted(set(aliases.values())) or (params.get("tables") or [])
+    if not final_tables:
+        final_tables = sorted(set(extract_tables_from_sql(sql)))
+    params["tables"] = final_tables
+
+    return {
+        "tool_name": "mysql.query",
+        "params": {"sql": sql, "tables": final_tables, "notes": params.get("notes", "")},
+        "confidence": confidence if ok else 0.9,
+        "rationale": rationale or "validated"
+    }
 
 # ---------------- CLI -----------------------------
 def main():
@@ -1087,8 +1042,6 @@ def main():
     ap.add_argument("--sql_only", action="store_true", help="Print only SQL when mysql.query is chosen")
     ap.add_argument("--print_json", action="store_true", help="Print final JSON tool call")
     ap.add_argument("--model", default=None, help="Gemini model name (or set GEMINI_ROUTER_MODEL in .env)")
-    ap.add_argument("--no_slice", action="store_true", help="Always pass the entire db.json to the LLM")
-    ap.add_argument("--force_slice", action="store_true", help="Always slice schema to relevant subset")
     args = ap.parse_args()
 
     try:
@@ -1098,16 +1051,10 @@ def main():
         print(f"Failed to read schema at {args.schema_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if not os.getenv("GOOGLE_API_KEY"):
-        print("ERROR: Set GOOGLE_API_KEY in your environment or .env file.", file=sys.stderr)
-        sys.exit(2)
-
     try:
-        out = route(args.query, schema_text, model_name=args.model,
-                    force_full=args.no_slice, force_slice=args.force_slice)
+        out = route(args.query, schema_text, model_name=args.model)
     except Exception as e:
-        out = {"tool_name": "web.search", "params": {"search_query": args.query},
-               "confidence": 0.5, "rationale": f"router error: {e}"}
+        out = {"tool_name": "web.search", "params": {"answer": f"Router error: {e}"}, "confidence": 0.0, "rationale": "exception"}
 
     if args.sql_only and out.get("tool_name") == "mysql.query":
         print(out["params"]["sql"].strip()); return
@@ -1121,9 +1068,13 @@ def main():
             if note:
                 print("Notes:", note)
         elif out.get("tool_name") == "web.search":
-            print("\n[web.search] Query:\n" + out["params"]["search_query"])
+            ans = out["params"].get("answer","")
+            print("\n[web.search] Answer:\n" + ans)
     else:
         print(json.dumps(out, ensure_ascii=False))
 
 if __name__ == "__main__":
+    if not os.getenv("GOOGLE_API_KEY"):
+        print("ERROR: Set GOOGLE_API_KEY in your environment or .env file.", file=sys.stderr)
+        sys.exit(2)
     main()
